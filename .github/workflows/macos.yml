@@ -1,0 +1,51 @@
+# Build ZeusBridge (Swift CLI) on macOS and upload artifact.
+name: ZeusBridge macOS
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release
+    runs-on: macos-14
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Swift / Xcode
+        run: |
+          swift --version
+          xcodebuild -version || true
+          sw_vers
+
+      - name: Build release
+        run: |
+          set -euo pipefail
+          swift build -c release
+          echo "bin path: $(swift build -c release --show-bin-path)"
+          ls -la "$(swift build -c release --show-bin-path)"
+
+      - name: Package dist + .app
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package_app.sh
+          ./scripts/package_app.sh
+          ls -laR dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeusBridge-macOS
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
