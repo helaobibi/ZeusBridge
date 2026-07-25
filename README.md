@@ -67,13 +67,28 @@ xattr -dr com.apple.quarantine zeus-bridge
 ./ZeusBridge.app/Contents/MacOS/ZeusBridge --dry-run -v
 ```
 
-## 联调步骤
+## 联调步骤（推荐：插件 `/test`）
 
-1. 魔兽 **窗口模式**（不要先上独占全屏）  
-2. 加载插件（对外名 EpicMusicBox / 对内 zeus），确认循环已绑定技能  
-3. `--dry-run -v`：应出现 `calibrated` / `anchor OK`  
-4. 循环跑技能时，日志类似：`[dry-run] rcl-f1 → RCTRL+F1`  
-5. 去掉 `--dry-run`，并保证魔兽在前台  
+TtMan 插件内置对接测试（`core/exteneded_api/zeus_bridge_test.lua`）：
+
+1. 魔兽 **窗口模式**，加载 EpicMusicBox / zeus  
+2. 本机：`./zeus-bridge --dry-run -v`  
+3. 游戏聊天框输入 **`/test`**（或 `/test help`）  
+4. 对照两边日志：
+
+| 游戏 `/test` 期望 | Bridge 终端应出现 |
+|------------------|-------------------|
+| anchor RGB / idle | `calibrated` / `anchor OK` |
+| TAP `rcl-f1` | `[dry-run] rcl-f1 → RCTRL+F1` |
+| TAP `rat-f5` | `[dry-run] rat-f5 → RALT+F5` |
+| HOLD `rst-f2` | `hold-down` / `hold-up` |
+| AI T=2 A=1 | `[dry-run ai] T=2 A=1` 四连 RALT+KP |
+
+子命令：`/test info|idle|tap|hold|ai|keys|all`
+
+5. 通过后去掉 `--dry-run`，魔兽保持前台正式注入  
+
+若修饰键无响应可加：`--unify-left-modifiers`；锚点失败试：`--cell-size 6`。
 
 ## 协议摘要
 
