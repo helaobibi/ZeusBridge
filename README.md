@@ -49,7 +49,17 @@ xattr -dr com.apple.quarantine zeus-bridge
 ./zeus-bridge --interval-ms 40 --cell-size 3
 ./zeus-bridge --title-regex 'World of Warcraft|WoW|Classic'
 ./zeus-bridge --origin-x 0 --origin-y 0
+./zeus-bridge --unify-left-modifiers   # 右修饰键改左，部分 Mac 客户端更稳
 ```
+
+### 状态处理
+
+| state | 行为 |
+|-------|------|
+| 0 | 输入焦点，不按键 |
+| 1 | 单击绑定键（`rcl-f1` 等） |
+| 3 | **按住**直到色块清空 |
+| 5 | Macro_AI：按 TNum/ANum 连打 4 次 `RALT+NUMPAD*` |
 
 `.app` 内二进制：
 

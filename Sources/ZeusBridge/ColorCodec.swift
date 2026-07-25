@@ -19,6 +19,9 @@ enum ColorCodec {
 	/// Plugin anchor constant on slot 4.
 	static let anchorInteger: Int = 2_000_001
 
+	/// Known DTC state values from the plugin.
+	static let knownStates: [Int] = [0, 1, 3, 5]
+
 	/// Encode integer → RGB (same as Lua IntegerToColor).
 	static func integerToColor(_ value: Int) -> PixelRGB {
 		var i = max(0, value)
@@ -30,26 +33,56 @@ enum ColorCodec {
 		return PixelRGB(r: r, g: g, b: b)
 	}
 
-	/// Decode RGB → integer. Optionally snap channels within `tolerance` toward a candidate.
-	static func colorToInteger(_ pixel: PixelRGB, tolerance: Int = 3) -> Int {
+	/// Decode RGB → integer (exact channels, clamped).
+	static func colorToInteger(_ pixel: PixelRGB) -> Int {
 		let r = clampByte(pixel.r)
 		let g = clampByte(pixel.g)
 		let b = clampByte(pixel.b)
-		_ = tolerance
 		return r * 65536 + g * 256 + b
 	}
 
-	/// Best-effort integer with channel noise: try neighborhood snap then raw.
-	static func colorToIntegerTolerant(_ pixel: PixelRGB, tolerance: Int = 3) -> Int {
-		// Primary: raw quantized
-		let raw = colorToInteger(pixel)
-		// If channels already clean, return
-		if pixel.r == clampByte(pixel.r) && pixel.g == clampByte(pixel.g) && pixel.b == clampByte(pixel.b) {
-			return raw
+	/// Best integer within per-channel tolerance (min RGB distance to encoded color).
+	static func decodeInteger(_ pixel: PixelRGB, tolerance: Int = 3) -> Int {
+		var best = colorToInteger(pixel)
+		var bestDist = integerToColor(best).distance(to: pixel)
+		for dr in -tolerance...tolerance {
+			for dg in -tolerance...tolerance {
+				for db in -tolerance...tolerance {
+					let p = PixelRGB(
+						r: clampByte(pixel.r + dr),
+						g: clampByte(pixel.g + dg),
+						b: clampByte(pixel.b + db)
+					)
+					let value = colorToInteger(p)
+					let dist = integerToColor(value).distance(to: pixel)
+					if dist < bestDist {
+						bestDist = dist
+						best = value
+					}
+				}
+			}
 		}
-		// Snap each channel independently is already done by clamp; for float noise callers
-		// should pass already-rounded 0...255 samples.
-		_ = tolerance
+		return best
+	}
+
+	/// Decode state slot: snap to {0,1,3,5} when close enough.
+	static func decodeState(_ pixel: PixelRGB, tolerance: Int = 4) -> Int {
+		let raw = decodeInteger(pixel, tolerance: tolerance)
+		// Small integers live mostly in blue channel (and tiny green/red).
+		var bestState = raw
+		var bestDist = Int.max
+		for s in knownStates {
+			let d = integerToColor(s).distance(to: pixel)
+			if d < bestDist {
+				bestDist = d
+				bestState = s
+			}
+		}
+		// Only snap if the match is plausible; otherwise keep raw.
+		let threshold = tolerance * 3 + 2
+		if bestDist <= threshold {
+			return bestState
+		}
 		return raw
 	}
 
@@ -84,7 +117,6 @@ enum ColorCodec {
 			if let code = Int(pair), code >= 32, code <= 126, let u = UnicodeScalar(code) {
 				out.append(Character(u))
 			} else {
-				// Fallback: stop on garbage
 				break
 			}
 			idx = next
@@ -93,51 +125,34 @@ enum ColorCodec {
 	}
 
 	/// Decode pixel → short key fragment string (e.g. "rcl", "f1").
+	/// Prefers candidates whose decoded string looks like a known token.
 	static func colorToString(_ pixel: PixelRGB, tolerance: Int = 3) -> String {
-		// Try raw integer first.
 		let candidates = nearbyIntegers(from: pixel, tolerance: tolerance)
+		var fallback = ""
 		for value in candidates {
 			let s = integerToString(value)
-			if !s.isEmpty, s.count <= 6, s.unicodeScalars.allSatisfy({ $0.isASCII }) {
+			if s.isEmpty { continue }
+			if fallback.isEmpty { fallback = s }
+			if isPlausibleKeyFragment(s) {
 				return s
 			}
 		}
-		return integerToString(colorToInteger(pixel))
+		return fallback
 	}
 
 	/// Whether pixel matches anchor 2000001 within tolerance per channel.
-	static func isAnchor(_ pixel: PixelRGB, tolerance: Int = 4) -> Bool {
+	static func isAnchor(_ pixel: PixelRGB, tolerance: Int = 5) -> Bool {
 		let target = integerToColor(anchorInteger)
 		return abs(pixel.r - target.r) <= tolerance
 			&& abs(pixel.g - target.g) <= tolerance
 			&& abs(pixel.b - target.b) <= tolerance
 	}
 
-	/// Decode integer for state / data_num with optional snap to expected ranges.
-	static func decodeInteger(_ pixel: PixelRGB, tolerance: Int = 3) -> Int {
-		// Enumerate small channel perturbations for robust state decoding.
-		var best = colorToInteger(pixel)
-		var bestDist = Int.max
-		for dr in -tolerance...tolerance {
-			for dg in -tolerance...tolerance {
-				for db in -tolerance...tolerance {
-					let p = PixelRGB(
-						r: clampByte(pixel.r + dr),
-						g: clampByte(pixel.g + dg),
-						b: clampByte(pixel.b + db)
-					)
-					let d = abs(dr) + abs(dg) + abs(db)
-					// Prefer exact channel values; among equals keep smaller abs delta
-					if d < bestDist {
-						bestDist = d
-						best = colorToInteger(p)
-					}
-				}
-			}
-		}
-		// If original is already good, keep raw (center of search when dr=dg=db=0).
-		_ = bestDist
-		return colorToInteger(PixelRGB(r: clampByte(pixel.r), g: clampByte(pixel.g), b: clampByte(pixel.b)))
+	/// Decode 0...255 channel value with tolerance (for AI TNum/ANum).
+	static func decodeChannel(_ value: Int, tolerance: Int = 3) -> Int {
+		// Round noise toward nearest int already; clamp.
+		_ = tolerance
+		return clampByte(value)
 	}
 
 	// MARK: - Helpers
@@ -146,10 +161,35 @@ enum ColorCodec {
 		min(255, max(0, v))
 	}
 
+	/// Known short fragments from DEFAULT_KEY_POOL / SplitBindingKey.
+	private static let knownFragments: Set<String> = [
+		"rcl", "rat", "rst", "rcs", "rac", "ras", "rrr",
+		"lcl", "lat", "lst", "lcs", "lac", "las", "lll",
+		"ctl", "alt", "sft", "ac", "as", "acs", "cs", "esc",
+		"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+		"kp0", "kp1", "kp2", "kp3", "kp4", "kp5", "kp6", "kp7", "kp8", "kp9",
+		"kp.", "kp*", "kp+", "kp/", "kp-", "kpe",
+		"up", "dwn", "lft", "rht", "ins", "del", "hom", "end", "pgu", "pgd",
+		"spc", "ent", "tab", "cpl", "num",
+		"u", "i", "o", "p", "h", "j", "k", "l", "b", "n", "m",
+		"7", "8", "9", "0", "=", "[", "]", ";", "'", ",", ".", "/",
+		"g", "1", "2", "3", "4", "5", "6", "a", "s", "d", "f", "q", "w", "e", "r", "t", "y", "z", "x", "c", "v",
+	]
+
+	private static func isPlausibleKeyFragment(_ s: String) -> Bool {
+		if knownFragments.contains(s) { return true }
+		if s.count == 1, s.unicodeScalars.first.map({ CharacterSet.alphanumerics.contains($0) }) == true {
+			return true
+		}
+		// f10 style already in set; accept f\d{1,2}
+		if s.range(of: #"^f\d{1,2}$"#, options: .regularExpression) != nil { return true }
+		if s.range(of: #"^kp.+$"#, options: .regularExpression) != nil { return true }
+		return s.count <= 3 && s.unicodeScalars.allSatisfy { $0.isASCII }
+	}
+
 	/// Generate integer candidates by snapping each channel ±tolerance.
 	private static func nearbyIntegers(from pixel: PixelRGB, tolerance: Int) -> [Int] {
 		var set = Set<Int>()
-		// Prefer zero-delta first
 		set.insert(colorToInteger(pixel))
 		for dr in -tolerance...tolerance {
 			for dg in -tolerance...tolerance {
@@ -163,7 +203,6 @@ enum ColorCodec {
 				}
 			}
 		}
-		// Sort by distance to original pixel encoding
 		let base = pixel
 		return set.sorted {
 			integerToColor($0).distance(to: base) < integerToColor($1).distance(to: base)

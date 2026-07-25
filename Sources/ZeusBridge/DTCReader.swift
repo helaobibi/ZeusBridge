@@ -9,11 +9,13 @@ struct DTCFrame: Equatable {
 	var anchorOK: Bool
 	var pixels: [PixelRGB] // 0..4
 	var sendkey: String
-	var rawKey2RGB: PixelRGB?
+	/// Macro_AI: decoded from slot3 when state==5 (G≈TNum, B≈ANum).
+	var aiTNum: Int?
+	var aiANum: Int?
 
 	static let empty = DTCFrame(
 		dataNum: 0, state: 0, key1: "", key2: "", anchorOK: false,
-		pixels: [], sendkey: "", rawKey2RGB: nil
+		pixels: [], sendkey: "", aiTNum: nil, aiANum: nil
 	)
 }
 
@@ -40,27 +42,35 @@ enum DTCReader {
 			pixels.append(p)
 		}
 
-		let anchorOK = ColorCodec.isAnchor(pixels[4], tolerance: max(tolerance, 4))
+		let anchorOK = ColorCodec.isAnchor(pixels[4], tolerance: max(tolerance, 5))
 		let dataNum = ColorCodec.decodeInteger(pixels[0], tolerance: tolerance)
-		let state = ColorCodec.decodeInteger(pixels[1], tolerance: tolerance)
+		let state = ColorCodec.decodeState(pixels[1], tolerance: max(tolerance, 4))
 
 		var key1 = ""
 		var key2 = ""
-		var rawKey2: PixelRGB? = nil
+		var aiT: Int? = nil
+		var aiA: Int? = nil
 
-		// Only decode keys when non-black-ish
-		if !isNearBlack(pixels[2], tolerance: tolerance) {
-			key1 = ColorCodec.colorToString(pixels[2], tolerance: tolerance)
-		}
 		if state == 5 {
-			// AI channel: raw G/B encode TNum/ANum
-			rawKey2 = pixels[3]
-			key2 = String(format: "ai:g=%d,b=%d", pixels[3].g, pixels[3].b)
-		} else if !isNearBlack(pixels[3], tolerance: tolerance) {
-			key2 = ColorCodec.colorToString(pixels[3], tolerance: tolerance)
+			// AI channel: key2 texture is {0, TNum/255, ANum/255} → sample G/B ≈ TNum/ANum
+			aiT = ColorCodec.decodeChannel(pixels[3].g, tolerance: tolerance)
+			aiA = ColorCodec.decodeChannel(pixels[3].b, tolerance: tolerance)
+			key2 = String(format: "ai:T=%d,A=%d", aiT ?? -1, aiA ?? -1)
+		} else {
+			if !isNearBlack(pixels[2], tolerance: tolerance) {
+				key1 = ColorCodec.colorToString(pixels[2], tolerance: tolerance)
+			}
+			if !isNearBlack(pixels[3], tolerance: tolerance) {
+				key2 = ColorCodec.colorToString(pixels[3], tolerance: tolerance)
+			}
 		}
 
-		let sendkey = KeyMap.joinFragments(key1: key1, key2: key2)
+		let sendkey: String
+		if state == 5 {
+			sendkey = key2
+		} else {
+			sendkey = KeyMap.joinFragments(key1: key1, key2: key2)
+		}
 
 		return DTCFrame(
 			dataNum: dataNum,
@@ -70,45 +80,123 @@ enum DTCReader {
 			anchorOK: anchorOK,
 			pixels: pixels,
 			sendkey: sendkey,
-			rawKey2RGB: rawKey2
+			aiTNum: aiT,
+			aiANum: aiA
 		)
 	}
 
-	/// Try a few origin offsets if default top-left misses anchor.
+	/// Try origin offsets and multiple cell sizes until anchor matches.
 	static func readWithCalibrate(
 		image: CGImage,
-		cellSize: Int,
-		tolerance: Int = 3
-	) throws -> (frame: DTCFrame, originX: Int, originY: Int) {
-		let candidates: [(Int, Int)] = {
-			var c: [(Int, Int)] = [(0, 0)]
-			for y in stride(from: 0, through: 12, by: 1) {
-				for x in stride(from: 0, through: 24, by: 1) {
-					if x == 0 && y == 0 { continue }
-					c.append((x, y))
-				}
-			}
-			return c
-		}()
+		preferredCellSize: Int,
+		tolerance: Int = 3,
+		searchAlternateCellSizes: Bool = true
+	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int) {
+		// Prefer configured size first, then common Retina multiples of DTC_SIZE=3.
+		var cellSizes = [preferredCellSize]
+		if searchAlternateCellSizes {
+			cellSizes.append(contentsOf: [3, 6, 2, 4, 5, 8, 9])
+		}
+		var seen = Set<Int>()
+		cellSizes = cellSizes.filter { seen.insert($0).inserted }
 
 		var last = DTCFrame.empty
-		for (ox, oy) in candidates {
-			// Need room for 5 cells
-			if ox + cellSize * slotCount > image.width { continue }
-			if oy + cellSize > image.height { continue }
-			let frame = try read(
-				image: image,
-				cellSize: cellSize,
-				originX: ox,
-				originY: oy,
-				tolerance: tolerance
-			)
-			last = frame
-			if frame.anchorOK {
-				return (frame, ox, oy)
+		var lastCell = preferredCellSize
+
+		for cell in cellSizes {
+			let maxX = min(40, max(0, image.width - cell * slotCount))
+			let maxY = min(28, max(0, image.height - cell))
+
+			// Phase 1: coarse grid (fast)
+			for oy in stride(from: 0, through: maxY, by: 2) {
+				for ox in stride(from: 0, through: maxX, by: 2) {
+					let frame = try read(
+						image: image,
+						cellSize: cell,
+						originX: ox,
+						originY: oy,
+						tolerance: tolerance
+					)
+					last = frame
+					lastCell = cell
+					if frame.anchorOK {
+						// Phase 2: refine ±1 around hit
+						return refineAnchor(
+							image: image,
+							cell: cell,
+							nearX: ox,
+							nearY: oy,
+							tolerance: tolerance
+						)
+					}
+				}
+			}
+			// Phase 1b: remaining odd offsets if needed (only small region)
+			for oy in 0...min(8, maxY) {
+				for ox in 0...min(12, maxX) {
+					if ox % 2 == 0 && oy % 2 == 0 { continue }
+					let frame = try read(
+						image: image,
+						cellSize: cell,
+						originX: ox,
+						originY: oy,
+						tolerance: tolerance
+					)
+					last = frame
+					lastCell = cell
+					if frame.anchorOK {
+						return (frame, ox, oy, cell)
+					}
+				}
 			}
 		}
-		return (last, 0, 0)
+		return (last, 0, 0, lastCell)
+	}
+
+	private static func refineAnchor(
+		image: CGImage,
+		cell: Int,
+		nearX: Int,
+		nearY: Int,
+		tolerance: Int
+	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int) {
+		var best: DTCFrame?
+		var bestX = nearX
+		var bestY = nearY
+		for dy in -1...1 {
+			for dx in -1...1 {
+				let ox = max(0, nearX + dx)
+				let oy = max(0, nearY + dy)
+				if ox + cell * slotCount > image.width { continue }
+				if oy + cell > image.height { continue }
+				let frame = try read(
+					image: image,
+					cellSize: cell,
+					originX: ox,
+					originY: oy,
+					tolerance: tolerance
+				)
+				if frame.anchorOK {
+					// Prefer closer to (0,0) among valid anchors
+					if best == nil || ox + oy < bestX + bestY {
+						best = frame
+						bestX = ox
+						bestY = oy
+					}
+				}
+			}
+		}
+		if let best {
+			return (best, bestX, bestY, cell)
+		}
+		let fallback = try read(
+			image: image,
+			cellSize: cell,
+			originX: nearX,
+			originY: nearY,
+			tolerance: tolerance
+		)
+		return (fallback, nearX, nearY, cell)
 	}
 
 	private static func isNearBlack(_ p: PixelRGB, tolerance: Int) -> Bool {
@@ -116,7 +204,7 @@ enum DTCReader {
 	}
 }
 
-/// Edge-triggered key dispatcher.
+/// Edge-triggered key dispatcher with hold + Macro_AI support.
 final class DTCBridgeLoop {
 	struct Config {
 		var titleRegex: String = "World of Warcraft|WoW|Classic"
@@ -125,26 +213,39 @@ final class DTCBridgeLoop {
 		var dryRun: Bool = false
 		var verbose: Bool = false
 		var tolerance: Int = 3
-		var holdDurationMs: Int = 50
 		var fixedOriginX: Int? = nil
 		var fixedOriginY: Int? = nil
+		/// Map right modifiers to left (helps some Mac WoW builds).
+		var unifyLeftModifiers: Bool = false
+		/// Auto-search cell size on calibrate (default true).
+		var autoCellSize: Bool = true
+		var aiGapMs: Int = 25
+		var aiHoldMs: Int = 25
+		var tapHoldMs: Int = 30
 	}
 
 	private let config: Config
 	private var lastSendkey: String = ""
 	private var lastState: Int = -1
+	private var lastAIToken: String = ""
 	private var originX: Int = 0
 	private var originY: Int = 0
+	private var cellSize: Int
 	private var calibrated: Bool = false
 	private var windowID: CGWindowID = 0
 	private var missAnchorCount: Int = 0
 
+	/// Currently held stroke for state=3 (nil when not holding).
+	private var heldStroke: KeyStroke? = nil
+	private var heldSendkey: String = ""
+
 	init(config: Config) {
 		self.config = config
+		self.cellSize = config.cellSize
 	}
 
 	func run() throws {
-		log("ZeusBridge starting (dryRun=\(config.dryRun) interval=\(config.intervalMs)ms cell=\(config.cellSize))")
+		log("ZeusBridge starting (dryRun=\(config.dryRun) interval=\(config.intervalMs)ms cell=\(config.cellSize) unifyL=\(config.unifyLeftModifiers))")
 		if !config.dryRun {
 			let trusted = KeySynthesizer.isAccessibilityTrusted(prompt: true)
 			if !trusted {
@@ -152,11 +253,13 @@ final class DTCBridgeLoop {
 			}
 		}
 
-		// Resolve window once; re-find on capture failure
 		try attachWindow()
 
 		if let x = config.fixedOriginX { originX = x; calibrated = true }
 		if let y = config.fixedOriginY { originY = y; calibrated = true }
+		if config.fixedOriginX != nil || config.fixedOriginY != nil {
+			cellSize = config.cellSize
+		}
 
 		while true {
 			autoreleasepool {
@@ -164,9 +267,11 @@ final class DTCBridgeLoop {
 					try tick()
 				} catch {
 					log("ERR: \(error)")
-					// Re-attach after errors
+					releaseHeld(reason: "error")
 					try? attachWindow()
-					calibrated = config.fixedOriginX != nil
+					if config.fixedOriginX == nil {
+						calibrated = false
+					}
 				}
 			}
 			usleep(useconds_t(max(10, config.intervalMs) * 1000))
@@ -186,7 +291,7 @@ final class DTCBridgeLoop {
 		if calibrated {
 			frame = try DTCReader.read(
 				image: image,
-				cellSize: config.cellSize,
+				cellSize: cellSize,
 				originX: originX,
 				originY: originY,
 				tolerance: config.tolerance
@@ -194,7 +299,6 @@ final class DTCBridgeLoop {
 			if !frame.anchorOK {
 				missAnchorCount += 1
 				if missAnchorCount >= 15 {
-					// Re-calibrate
 					calibrated = false
 					missAnchorCount = 0
 					if config.verbose { log("anchor lost → recalibrate") }
@@ -205,72 +309,160 @@ final class DTCBridgeLoop {
 		} else {
 			let result = try DTCReader.readWithCalibrate(
 				image: image,
-				cellSize: config.cellSize,
-				tolerance: config.tolerance
+				preferredCellSize: config.cellSize,
+				tolerance: config.tolerance,
+				searchAlternateCellSizes: config.autoCellSize
 			)
 			frame = result.frame
 			if frame.anchorOK {
 				originX = result.originX
 				originY = result.originY
+				cellSize = result.cellSize
 				calibrated = true
-				log("calibrated origin=(\(originX),\(originY)) anchor OK")
+				log("calibrated origin=(\(originX),\(originY)) cell=\(cellSize) anchor OK")
 			}
 		}
 
 		if config.verbose {
 			let px = frame.pixels.map { $0.description }.joined(separator: " ")
-			log("state=\(frame.state) key1=\(frame.key1) key2=\(frame.key2) send=\(frame.sendkey) anchor=\(frame.anchorOK) \(px)")
+			log("state=\(frame.state) key1=\(frame.key1) key2=\(frame.key2) send=\(frame.sendkey) anchor=\(frame.anchorOK) cell=\(cellSize) \(px)")
 		}
 
 		guard frame.anchorOK else {
+			releaseHeld(reason: "no-anchor")
 			if config.verbose { log("skip: no anchor") }
 			return
 		}
 
-		// state 0: keyboard focus — do not press
+		// state 0: keyboard focus — do not press; release any hold
 		if frame.state == 0 {
+			releaseHeld(reason: "focus")
 			lastSendkey = ""
 			lastState = 0
+			lastAIToken = ""
 			return
 		}
 
-		// state 5: AI channel — log only in v1
+		// state 5: Macro_AI — four RALT+NUMPAD taps encoding TNum/ANum
 		if frame.state == 5 {
-			if config.verbose || config.dryRun {
-				log("[ai] \(frame.key2) (not injected in v1)")
-			}
+			releaseHeld(reason: "ai")
+			try handleAI(frame)
+			lastState = 5
+			lastSendkey = ""
 			return
 		}
 
 		let send = frame.sendkey
 		if send.isEmpty {
-			// Keys cleared after PIXEL_INTERVAL — reset edge detector
+			// Keys cleared after PIXEL_INTERVAL — end hold + reset edge
+			releaseHeld(reason: "clear")
 			lastSendkey = ""
 			lastState = frame.state
+			lastAIToken = ""
 			return
 		}
 
-		// Edge trigger: new sendkey or re-assert after clear
+		// state 3: hold while pixels stay active
+		if frame.state == 3 {
+			try handleHold(send: send)
+			lastSendkey = send
+			lastState = 3
+			return
+		}
+
+		// state 1 (and any other): edge-triggered tap
+		// If we were holding something else, release first.
+		if heldStroke != nil {
+			releaseHeld(reason: "tap")
+		}
+
 		if send == lastSendkey && frame.state == lastState {
 			return
 		}
 		lastSendkey = send
 		lastState = frame.state
+		lastAIToken = ""
 
 		do {
-			let stroke = try KeyMap.parse(send)
+			var stroke = try KeyMap.parse(send)
+			if config.unifyLeftModifiers {
+				stroke = stroke.unifiedLeftModifiers()
+			}
 			if config.dryRun {
 				log("[dry-run] \(send) → \(stroke.label)")
 			} else {
-				if frame.state == 3 {
-					KeySynthesizer.hold(stroke, durationMs: config.holdDurationMs)
-				} else {
-					KeySynthesizer.tap(stroke)
-				}
+				KeySynthesizer.tap(stroke, holdMs: config.tapHoldMs)
 				log("[ok] \(send) → \(stroke.label)")
 			}
 		} catch {
 			log("[map-fail] \(send): \(error)")
+		}
+	}
+
+	private func handleHold(send: String) throws {
+		if heldStroke != nil, heldSendkey == send {
+			// already holding the same key
+			return
+		}
+		// switch hold target
+		releaseHeld(reason: "switch")
+		var stroke = try KeyMap.parse(send)
+		if config.unifyLeftModifiers {
+			stroke = stroke.unifiedLeftModifiers()
+		}
+		if config.dryRun {
+			log("[dry-run hold-down] \(send) → \(stroke.label)")
+			heldStroke = stroke
+			heldSendkey = send
+			return
+		}
+		KeySynthesizer.keyDown(stroke)
+		heldStroke = stroke
+		heldSendkey = send
+		log("[hold-down] \(send) → \(stroke.label)")
+	}
+
+	private func releaseHeld(reason: String) {
+		guard let stroke = heldStroke else { return }
+		if config.dryRun {
+			log("[dry-run hold-up] \(heldSendkey) (\(reason))")
+		} else {
+			KeySynthesizer.keyUp(stroke)
+			log("[hold-up] \(heldSendkey) (\(reason))")
+		}
+		heldStroke = nil
+		heldSendkey = ""
+	}
+
+	private func handleAI(_ frame: DTCFrame) throws {
+		guard let t = frame.aiTNum, let a = frame.aiANum else {
+			if config.verbose { log("[ai] missing T/A channels") }
+			return
+		}
+		let token = "\(t):\(a)"
+		// Edge: only fire once per AI paint window
+		if token == lastAIToken {
+			return
+		}
+		// Also require non-zero-ish paint (ANum at least 1 for a real skill slot usually)
+		// Allow TNum=1 (empty unit) + ANum>=1
+		if t == 0 && a == 0 {
+			return
+		}
+
+		var strokes = try KeyMap.aiSequence(tNum: t, aNum: a)
+		if config.unifyLeftModifiers {
+			// RALT → LALT for each digit
+			strokes = strokes.map { $0.unifiedLeftModifiers() }
+		}
+		let label = strokes.map(\.label).joined(separator: " ")
+		lastAIToken = token
+
+		if config.dryRun {
+			log("[dry-run ai] T=\(t) A=\(a) → \(label)")
+		} else {
+			KeySynthesizer.tapSequence(strokes, gapMs: config.aiGapMs, holdMs: config.aiHoldMs)
+			log("[ok ai] T=\(t) A=\(a) → \(label)")
 		}
 	}
 

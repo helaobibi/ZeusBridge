@@ -75,7 +75,6 @@ enum WindowCapture {
 			return regex.firstMatch(in: s, options: [], range: range) != nil
 		}
 
-		// Prefer owner or name match; larger area wins
 		let hit = windows
 			.filter { matches($0.name) || matches($0.owner) }
 			.sorted { ($0.bounds.width * $0.bounds.height) > ($1.bounds.width * $1.bounds.height) }
@@ -85,34 +84,29 @@ enum WindowCapture {
 		throw WindowCaptureError.notFound(titleRegex)
 	}
 
-	/// Capture full window image (window-local pixels, retina-aware buffer).
+	/// Capture full window image. Prefer true backing pixels (better for 3px DTC cells).
 	static func captureWindow(id: CGWindowID) throws -> CGImage {
-		let image = CGWindowListCreateImage(
+		// Best: native backing resolution without window shadow.
+		if let image = CGWindowListCreateImage(
 			.null,
 			.optionIncludingWindow,
 			id,
-			[.boundsIgnoreFraming, .nominalResolution]
-		)
-		// .nominalResolution: prefer native backing pixels when possible
-		// Fallback without nominal if nil
-		if let image { return image }
-		guard let fallback = CGWindowListCreateImage(
+			[.boundsIgnoreFraming, .bestResolution]
+		) {
+			return image
+		}
+		if let image = CGWindowListCreateImage(
 			.null,
 			.optionIncludingWindow,
 			id,
 			[.boundsIgnoreFraming]
-		) else {
-			throw WindowCaptureError.captureFailed
+		) {
+			return image
 		}
-		return fallback
+		throw WindowCaptureError.captureFailed
 	}
 
-	/// Sample average-ish center pixel of a cell in top-left grid.
-	/// - Parameters:
-	///   - image: window capture
-	///   - slot: 0..n-1 horizontal index
-	///   - cellSize: DTC_SIZE (default 3)
-	///   - originX/Y: top-left of grid in image pixels
+	/// Sample median pixel of a cell in top-left grid.
 	static func sampleCell(
 		image: CGImage,
 		slot: Int,
@@ -122,14 +116,13 @@ enum WindowCapture {
 	) throws -> PixelRGB {
 		let w = image.width
 		let h = image.height
-		let cx = originX + slot * cellSize + cellSize / 2
-		let cy = originY + cellSize / 2
+		let cx = originX + slot * cellSize + max(0, cellSize / 2)
+		let cy = originY + max(0, cellSize / 2)
 		guard cx >= 0, cy >= 0, cx < w, cy < h else {
 			throw WindowCaptureError.invalidImage
 		}
 
-		// Read a small neighborhood and take median-ish average for stability
-		let radius = max(0, cellSize / 2)
+		let radius = max(0, (cellSize - 1) / 2)
 		var samples: [PixelRGB] = []
 		for dy in -radius...radius {
 			for dx in -radius...radius {
@@ -149,7 +142,6 @@ enum WindowCapture {
 	// MARK: - Pixel read
 
 	private static func readPixel(image: CGImage, x: Int, y: Int) -> PixelRGB? {
-		// Crop 1x1 — simple and safe across bitmap layouts
 		guard let cropped = image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)) else {
 			return nil
 		}
@@ -167,7 +159,6 @@ enum WindowCapture {
 			return nil
 		}
 		ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: 1, height: 1))
-		// Un-premultiply if needed
 		let a = Int(rgba[3])
 		if a == 0 {
 			return PixelRGB(r: 0, g: 0, b: 0)

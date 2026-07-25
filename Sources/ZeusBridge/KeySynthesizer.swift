@@ -11,31 +11,37 @@ enum KeySynthesizer {
 
 	/// Tap key: modifiers down → key down → key up → modifiers up.
 	static func tap(_ stroke: KeyStroke, holdMs: Int = 30) {
-		let source = CGEventSource(stateID: .hidSystemState)
+		keyDown(stroke)
+		if holdMs > 0 {
+			usleep(useconds_t(holdMs * 1000))
+		}
+		keyUp(stroke)
+	}
 
-		// Press modifiers
+	/// Press without release (for state=3 hold-until-clear).
+	static func keyDown(_ stroke: KeyStroke) {
+		let source = CGEventSource(stateID: .hidSystemState)
 		for mod in stroke.modifierKeyCodes {
 			if let e = CGEvent(keyboardEventSource: source, virtualKey: mod, keyDown: true) {
 				e.flags = flags(for: stroke.modifierKeyCodes, including: mod, downSoFar: true)
 				e.post(tap: .cghidEventTap)
 			}
 		}
-
-		// Main key down/up with full modifier flags
 		let fullFlags = flags(for: stroke.modifierKeyCodes, including: nil, downSoFar: true)
 		if let down = CGEvent(keyboardEventSource: source, virtualKey: stroke.keyCode, keyDown: true) {
 			down.flags = fullFlags
 			down.post(tap: .cghidEventTap)
 		}
-		if holdMs > 0 {
-			usleep(useconds_t(holdMs * 1000))
-		}
+	}
+
+	/// Release a previously held stroke.
+	static func keyUp(_ stroke: KeyStroke) {
+		let source = CGEventSource(stateID: .hidSystemState)
+		let fullFlags = flags(for: stroke.modifierKeyCodes, including: nil, downSoFar: true)
 		if let up = CGEvent(keyboardEventSource: source, virtualKey: stroke.keyCode, keyDown: false) {
 			up.flags = fullFlags
 			up.post(tap: .cghidEventTap)
 		}
-
-		// Release modifiers reverse order
 		for mod in stroke.modifierKeyCodes.reversed() {
 			if let e = CGEvent(keyboardEventSource: source, virtualKey: mod, keyDown: false) {
 				e.flags = []
@@ -44,29 +50,19 @@ enum KeySynthesizer {
 		}
 	}
 
-	/// Hold key for duration (state=3 style).
+	/// Hold for a fixed duration then release (legacy helper).
 	static func hold(_ stroke: KeyStroke, durationMs: Int) {
-		let source = CGEventSource(stateID: .hidSystemState)
-		for mod in stroke.modifierKeyCodes {
-			if let e = CGEvent(keyboardEventSource: source, virtualKey: mod, keyDown: true) {
-				e.flags = flags(for: stroke.modifierKeyCodes, including: mod, downSoFar: true)
-				e.post(tap: .cghidEventTap)
-			}
-		}
-		let fullFlags = flags(for: stroke.modifierKeyCodes, including: nil, downSoFar: true)
-		if let down = CGEvent(keyboardEventSource: source, virtualKey: stroke.keyCode, keyDown: true) {
-			down.flags = fullFlags
-			down.post(tap: .cghidEventTap)
-		}
+		keyDown(stroke)
 		usleep(useconds_t(max(1, durationMs) * 1000))
-		if let up = CGEvent(keyboardEventSource: source, virtualKey: stroke.keyCode, keyDown: false) {
-			up.flags = fullFlags
-			up.post(tap: .cghidEventTap)
-		}
-		for mod in stroke.modifierKeyCodes.reversed() {
-			if let e = CGEvent(keyboardEventSource: source, virtualKey: mod, keyDown: false) {
-				e.flags = []
-				e.post(tap: .cghidEventTap)
+		keyUp(stroke)
+	}
+
+	/// Tap a sequence of strokes with a small gap (Macro_AI base-14 digits).
+	static func tapSequence(_ strokes: [KeyStroke], gapMs: Int = 25, holdMs: Int = 25) {
+		for (i, s) in strokes.enumerated() {
+			tap(s, holdMs: holdMs)
+			if i + 1 < strokes.count, gapMs > 0 {
+				usleep(useconds_t(gapMs * 1000))
 			}
 		}
 	}
@@ -81,7 +77,6 @@ enum KeySynthesizer {
 		var f: CGEventFlags = []
 		let list: [CGKeyCode]
 		if let including, downSoFar {
-			// flags for events after this mod is considered down: all mods up to and including
 			if let idx = mods.firstIndex(of: including) {
 				list = Array(mods[0...idx])
 			} else {

@@ -11,24 +11,45 @@ struct KeyStroke: Equatable, CustomStringConvertible {
 	var label: String
 
 	var description: String { label }
+
+	/// Collapse L/R modifiers to left-side only (macOS/WoW compatibility fallback).
+	func unifiedLeftModifiers() -> KeyStroke {
+		let map: [CGKeyCode: CGKeyCode] = [
+			62: 59, // right control → left
+			61: 58, // right option → left
+			60: 56, // right shift → left
+		]
+		var seen = Set<CGKeyCode>()
+		var mods: [CGKeyCode] = []
+		for m in modifierKeyCodes {
+			let u = map[m] ?? m
+			if !seen.contains(u) {
+				seen.insert(u)
+				mods.append(u)
+			}
+		}
+		return KeyStroke(modifierKeyCodes: mods, keyCode: keyCode, label: label + " [L]")
+	}
 }
 
 enum KeyMapError: Error, CustomStringConvertible {
 	case empty
 	case unknownPrefix(String)
 	case unknownKey(String)
+	case invalidAI(String)
 
 	var description: String {
 		switch self {
 		case .empty: return "empty sendkey"
 		case .unknownPrefix(let p): return "unknown prefix: \(p)"
 		case .unknownKey(let k): return "unknown key: \(k)"
+		case .invalidAI(let m): return "invalid AI payload: \(m)"
 		}
 	}
 }
 
 /// Maps plugin `sendkey` fragments to macOS CGKeyCodes.
-/// Aligns with `DEFAULT_KEY_POOL` / `SplitBindingKey` in compatibility.lua.
+/// Aligns with `DEFAULT_KEY_POOL` / `SplitBindingKey` / Uzi Macro_AI in compatibility.lua + bm_functions.lua.
 enum KeyMap {
 	// macOS virtual key codes (ANSI)
 	private static let kLeftShift: CGKeyCode = 56
@@ -69,7 +90,6 @@ enum KeyMap {
 	/// Key token → CGKeyCode (lowercase).
 	private static let keyCodes: [String: CGKeyCode] = {
 		var m: [String: CGKeyCode] = [:]
-		// Letters
 		let letters: [(String, CGKeyCode)] = [
 			("a", 0), ("s", 1), ("d", 2), ("f", 3), ("h", 4), ("g", 5), ("z", 6), ("x", 7),
 			("c", 8), ("v", 9), ("b", 11), ("q", 12), ("w", 13), ("e", 14), ("r", 15),
@@ -81,13 +101,11 @@ enum KeyMap {
 		]
 		for (k, v) in letters { m[k] = v }
 
-		// Function keys
 		let fkeys: [CGKeyCode] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111]
 		for i in 1...12 {
 			m["f\(i)"] = fkeys[i - 1]
 		}
 
-		// Keypad
 		m["kp0"] = 82
 		m["kp1"] = 83
 		m["kp2"] = 84
@@ -103,9 +121,8 @@ enum KeyMap {
 		m["kp+"] = 69
 		m["kp/"] = 75
 		m["kp-"] = 78
-		m["kpe"] = 76 // keypad enter
+		m["kpe"] = 76
 
-		// Navigation / specials (plugin short names)
 		m["up"] = 126
 		m["dwn"] = 125
 		m["lft"] = 123
@@ -120,10 +137,9 @@ enum KeyMap {
 		m["ent"] = 36
 		m["tab"] = 48
 		m["esc"] = 53
-		m["cpl"] = 57 // caps lock
-		m["num"] = 71 // num lock / clear
+		m["cpl"] = 57
+		m["num"] = 71
 
-		// Full english aliases
 		m["down"] = 125
 		m["left"] = 123
 		m["right"] = 124
@@ -139,16 +155,43 @@ enum KeyMap {
 		return m
 	}()
 
+	/// Uzi.Z_key digit 0...13 → RALT + numpad key (KNum = n-1, Z_key index = n).
+	/// Matches bm_functions.lua Uzi.Z_key[1..14].
+	private static let aiDigitKeys: [CGKeyCode] = [
+		83, // 0 → NUMPAD1
+		84, // 1 → NUMPAD2
+		85, // 2 → NUMPAD3
+		86, // 3 → NUMPAD4
+		87, // 4 → NUMPAD5
+		88, // 5 → NUMPAD6
+		89, // 6 → NUMPAD7
+		91, // 7 → NUMPAD8
+		92, // 8 → NUMPAD9
+		// digit 9 → NUMPADDIVIDE (Z_key[10])
+		75,
+		// digit 10 → NUMPADMULTIPLY
+		67,
+		// digit 11 → NUMPADMINUS
+		78,
+		// digit 12 → NUMPADPLUS
+		69,
+		// digit 13 → NUMPADDECIMAL
+		65,
+	]
+
+	private static let aiDigitLabels = [
+		"KP1", "KP2", "KP3", "KP4", "KP5", "KP6", "KP7", "KP8", "KP9",
+		"KP/", "KP*", "KP-", "KP+", "KP.",
+	]
+
 	/// Parse full sendkey like "rcl-f1" or single fragment "f1".
 	static func parse(_ sendkey: String) throws -> KeyStroke {
 		let raw = sendkey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 		if raw.isEmpty { throw KeyMapError.empty }
 		if raw == "-" {
-			// Plugin sentinel; map to minus key without mods
 			return KeyStroke(modifierKeyCodes: [], keyCode: 27, label: "-")
 		}
 
-		// Longest-prefix match among known prefixes + "-"
 		let prefixes = prefixModifiers.keys.sorted { $0.count > $1.count }
 		for prefix in prefixes {
 			let head = prefix + "-"
@@ -162,15 +205,12 @@ enum KeyMap {
 					label: formatLabel(prefix: prefix, key: rest)
 				)
 			}
-			// Bare prefix alone (no key) — invalid for casting, ignore
 		}
 
-		// No known prefix: treat whole string as key token (e.g. "f1", "g")
 		if let kc = resolveKey(raw) {
 			return KeyStroke(modifierKeyCodes: [], keyCode: kc, label: raw.uppercased())
 		}
 
-		// Split on first "-" as generic prefix-key
 		if let idx = raw.firstIndex(of: "-") {
 			let p = String(raw[..<idx])
 			let k = String(raw[raw.index(after: idx)...])
@@ -190,18 +230,39 @@ enum KeyMap {
 		if a.isEmpty && b.isEmpty { return "" }
 		if a.isEmpty { return b }
 		if b.isEmpty { return a }
-		// key1 is prefix without trailing dash (plugin SplitBindingKey)
-		if prefixModifiers[a] != nil {
-			return "\(a)-\(b)"
-		}
 		return "\(a)-\(b)"
+	}
+
+	/// Macro_AI: encode TNum/ANum as 4 base-14 RALT+NUMPAD taps (Uzi secure handler).
+	/// Plugin: `DTC:SetKeyPixel_AI({0, TNum/255, ANum/255})` with state=5.
+	static func aiSequence(tNum: Int, aNum: Int) throws -> [KeyStroke] {
+		let t = tNum
+		let a = aNum
+		let maxV = 14 * 14 - 1
+		guard t >= 0, t <= maxV, a >= 0, a <= maxV else {
+			throw KeyMapError.invalidAI("TNum=\(t) ANum=\(a) out of 0...\(maxV)")
+		}
+		let digits = [
+			t / 14,
+			t % 14,
+			a / 14,
+			a % 14,
+		]
+		return try digits.map { d in
+			guard d >= 0, d < aiDigitKeys.count else {
+				throw KeyMapError.invalidAI("digit \(d)")
+			}
+			return KeyStroke(
+				modifierKeyCodes: [kRightOption],
+				keyCode: aiDigitKeys[d],
+				label: "RALT+\(aiDigitLabels[d])"
+			)
+		}
 	}
 
 	private static func resolveKey(_ token: String) -> CGKeyCode? {
 		let t = token.lowercased()
 		if let kc = keyCodes[t] { return kc }
-		// Single character
-		if t.count == 1, let kc = keyCodes[t] { return kc }
 		return nil
 	}
 

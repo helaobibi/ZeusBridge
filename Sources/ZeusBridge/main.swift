@@ -13,6 +13,8 @@ struct CLIOptions {
 	var titleRegex = "World of Warcraft|WoW|Classic"
 	var originX: Int? = nil
 	var originY: Int? = nil
+	var unifyLeftModifiers = false
+	var noAutoCell = false
 	var showHelp = false
 }
 
@@ -45,6 +47,10 @@ func parseArgs(_ args: [String]) -> CLIOptions {
 		case "--origin-y":
 			i += 1
 			if i < args.count, let v = Int(args[i]) { opt.originY = v }
+		case "--unify-left-modifiers", "--unify-modifiers":
+			opt.unifyLeftModifiers = true
+		case "--no-auto-cell":
+			opt.noAutoCell = true
 		default:
 			if a.hasPrefix("-") {
 				fputs("unknown option: \(a)\n", stderr)
@@ -63,26 +69,27 @@ func printHelp() {
 	  ZeusBridge [options]
 
 	Options:
-	  --list-windows          List on-screen windows and exit
-	  --dry-run               Decode and print keys, do not inject
-	  --interval-ms <n>       Poll interval (default 40)
-	  --cell-size <n>         DTC cell size in pixels (default 3)
-	  --title-regex <re>      Window title/owner regex (default: World of Warcraft|WoW|Classic)
-	  --origin-x <n>          Fix grid origin X in window image pixels
-	  --origin-y <n>          Fix grid origin Y in window image pixels
-	  -v, --verbose           Verbose pixel dump each tick
-	  -h, --help              Show this help
+	  --list-windows              List on-screen windows and exit
+	  --dry-run                   Decode and print keys, do not inject
+	  --interval-ms <n>           Poll interval (default 40)
+	  --cell-size <n>             Preferred DTC cell size (default 3; auto-detects 3/6/…)
+	  --no-auto-cell              Do not search alternate cell sizes
+	  --title-regex <re>          Window title/owner regex
+	  --origin-x <n>              Fix grid origin X in window image pixels
+	  --origin-y <n>              Fix grid origin Y in window image pixels
+	  --unify-left-modifiers      Map RCTRL/RALT/RSHIFT → left modifiers
+	  -v, --verbose               Verbose pixel dump each tick
+	  -h, --help                  Show this help
 
 	Permissions (macOS):
-	  1. Screen Recording  — System Settings → Privacy & Security → Screen Recording
-	  2. Accessibility     — System Settings → Privacy & Security → Accessibility
-	  Grant for ZeusBridge.app (or the terminal if you run the bare binary).
+	  1. Screen Recording
+	  2. Accessibility
 
-	Workflow:
-	  1. Start WoW in windowed mode, load the addon (EpicMusicBox / zeus).
-	  2. ZeusBridge --dry-run -v
-	  3. Confirm anchor=true and keys like rcl-f1 when rotation fires.
-	  4. Re-run without --dry-run.
+	Protocol:
+	  state 0  → skip (chat/focus)
+	  state 1  → tap binding key (rcl-f1 …)
+	  state 3  → hold key until pixels clear
+	  state 5  → Macro_AI: 4× RALT+NUMPAD (TNum/ANum base-14)
 
 	"""
 	print(help)
@@ -116,6 +123,8 @@ cfg.dryRun = opt.dryRun
 cfg.verbose = opt.verbose
 cfg.fixedOriginX = opt.originX
 cfg.fixedOriginY = opt.originY
+cfg.unifyLeftModifiers = opt.unifyLeftModifiers
+cfg.autoCellSize = !opt.noAutoCell
 
 let loop = DTCBridgeLoop(config: cfg)
 do {
