@@ -7,14 +7,18 @@ struct DTCFrame: Equatable {
 	var key1: String
 	var key2: String
 	var anchorOK: Bool
+	/// Full multi-slot validation (not just teal-ish slot4).
+	var gridOK: Bool
 	var pixels: [PixelRGB]
 	var sendkey: String
 	var aiTNum: Int?
 	var aiANum: Int?
+	/// Lower is better (used during calibrate).
+	var qualityScore: Int
 
 	static let empty = DTCFrame(
-		dataNum: 0, state: 0, key1: "", key2: "", anchorOK: false,
-		pixels: [], sendkey: "", aiTNum: nil, aiANum: nil
+		dataNum: 0, state: 0, key1: "", key2: "", anchorOK: false, gridOK: false,
+		pixels: [], sendkey: "", aiTNum: nil, aiANum: nil, qualityScore: 999_999
 	)
 }
 
@@ -40,10 +44,20 @@ enum DTCReader {
 			)
 			pixels.append(p)
 		}
-		return decodePixels(pixels, tolerance: tolerance)
+		// Flatness of each cell (solid UI color vs photo noise)
+		var flatness = 0
+		for slot in 0..<slotCount {
+			flatness += cellVariance(
+				buffer: buffer,
+				slot: slot,
+				cellSize: cellSize,
+				originX: originX,
+				originY: originY
+			)
+		}
+		return decodePixels(pixels, flatnessPenalty: flatness, tolerance: tolerance)
 	}
 
-	/// Convenience from CGImage.
 	static func read(
 		image: CGImage,
 		cellSize: Int,
@@ -57,12 +71,17 @@ enum DTCReader {
 		return try read(buffer: buf, cellSize: cellSize, originX: originX, originY: originY, tolerance: tolerance)
 	}
 
-	private static func decodePixels(_ pixels: [PixelRGB], tolerance: Int) -> DTCFrame {
-		// Looser anchor match: Mac display color can shift DTC teal.
-		let anchorTol = max(tolerance, 18)
+	private static func decodePixels(_ pixels: [PixelRGB], flatnessPenalty: Int, tolerance: Int) -> DTCFrame {
+		let anchorTarget = ColorCodec.integerToColor(ColorCodec.anchorInteger)
+		let anchorDist = pixels[4].distance(to: anchorTarget)
+		// Tighter than before for "looks like anchor", but still allow mild shift.
+		let anchorTol = max(tolerance, 14)
 		let anchorOK = ColorCodec.isAnchor(pixels[4], tolerance: anchorTol)
+
 		let dataNum = ColorCodec.decodeInteger(pixels[0], tolerance: tolerance)
-		let state = ColorCodec.decodeState(pixels[1], tolerance: max(tolerance, 6))
+		// For validation use strict known-state check (do not accept huge junk).
+		let stateStrict = strictState(pixels[1])
+		let state = stateStrict ?? ColorCodec.decodeState(pixels[1], tolerance: max(tolerance, 6))
 
 		var key1 = ""
 		var key2 = ""
@@ -74,10 +93,10 @@ enum DTCReader {
 			aiA = ColorCodec.decodeChannel(pixels[3].b, tolerance: tolerance)
 			key2 = String(format: "ai:T=%d,A=%d", aiT ?? -1, aiA ?? -1)
 		} else {
-			if !isNearBlack(pixels[2], tolerance: tolerance) {
+			if !isNearBlack(pixels[2], tolerance: max(tolerance, 8)) {
 				key1 = ColorCodec.colorToString(pixels[2], tolerance: tolerance)
 			}
-			if !isNearBlack(pixels[3], tolerance: tolerance) {
+			if !isNearBlack(pixels[3], tolerance: max(tolerance, 8)) {
 				key2 = ColorCodec.colorToString(pixels[3], tolerance: tolerance)
 			}
 		}
@@ -89,20 +108,103 @@ enum DTCReader {
 			sendkey = KeyMap.joinFragments(key1: key1, key2: key2)
 		}
 
+		// --- Grid validation (reject scenery false positives) ---
+		// Real DTC idle: slot1≈state tiny (0,0,1), slot2/3 black, slot4 teal solid.
+		let stateOK = stateStrict != nil
+		// Slot1 should be dark-ish for states 0/1/3 (only blue/green small), state5 still dark R
+		let slot1Dark = pixels[1].r <= 40 && pixels[1].g <= 40
+		// Keys idle → near black
+		let keysIdleDark = isNearBlack(pixels[2], tolerance: 20) && isNearBlack(pixels[3], tolerance: 20)
+		// Or actively sending keys / AI: keys not required dark
+		let keysActive = !keysIdleDark || state == 5 || state == 3
+		// Flat cells (photo noise has high variance)
+		let flatOK = flatnessPenalty <= 80 * slotCount  // avg variance per cell <= 80
+
+		// Score: lower better
+		var score = 0
+		score += anchorDist * 3
+		score += flatnessPenalty
+		if !stateOK { score += 5000 }
+		if !slot1Dark && state != 5 { score += 2000 }
+		// Prefer idle-looking grid or active with known state
+		if stateOK && keysIdleDark { score -= 50 }
+		if stateOK && keysActive && !keysIdleDark { score -= 20 }
+		// Prefer solid teal closer to exact
+		if anchorDist > 40 { score += 1000 }
+
+		// Accept grid only if multi-signal OK
+		let gridOK = anchorOK
+			&& stateOK
+			&& flatOK
+			&& (slot1Dark || state == 5)
+			&& anchorDist <= 45
+
 		return DTCFrame(
 			dataNum: dataNum,
 			state: state,
 			key1: key1,
 			key2: key2,
 			anchorOK: anchorOK,
+			gridOK: gridOK,
 			pixels: pixels,
 			sendkey: sendkey,
 			aiTNum: aiT,
-			aiANum: aiA
+			aiANum: aiA,
+			qualityScore: score
 		)
 	}
 
-	/// Calibrate: scan for anchor teal (30,132,129), then fit 5-cell grid.
+	/// Only accept exact known states with pixels near IntegerToColor(state).
+	private static func strictState(_ pixel: PixelRGB) -> Int? {
+		let targetTol = 22
+		var best: Int? = nil
+		var bestD = Int.max
+		for s in ColorCodec.knownStates {
+			let t = ColorCodec.integerToColor(s)
+			let d = pixel.distance(to: t)
+			if d < bestD {
+				bestD = d
+				best = s
+			}
+		}
+		// state 1 is (0,0,1) — nearly black; allow slightly higher
+		if let best, bestD <= targetTol {
+			return best
+		}
+		// Also accept nearly black as state 0/1 (focus/idle) if very dark
+		if pixel.r <= 8 && pixel.g <= 8 && pixel.b <= 12 {
+			return pixel.b <= 2 ? 0 : 1
+		}
+		return nil
+	}
+
+	/// Sum of max-min channel ranges inside a cell (0 = perfectly flat).
+	private static func cellVariance(
+		buffer: PixelBuffer,
+		slot: Int,
+		cellSize: Int,
+		originX: Int,
+		originY: Int
+	) -> Int {
+		let x0 = originX + slot * cellSize
+		let y0 = originY
+		var minR = 255, minG = 255, minB = 255
+		var maxR = 0, maxG = 0, maxB = 0
+		var n = 0
+		for y in y0..<(y0 + cellSize) {
+			for x in x0..<(x0 + cellSize) {
+				guard let p = buffer.pixel(x: x, y: y) else { continue }
+				minR = min(minR, p.r); maxR = max(maxR, p.r)
+				minG = min(minG, p.g); maxG = max(maxG, p.g)
+				minB = min(minB, p.b); maxB = max(maxB, p.b)
+				n += 1
+			}
+		}
+		if n == 0 { return 999 }
+		return (maxR - minR) + (maxG - minG) + (maxB - minB)
+	}
+
+	/// Calibrate: find best-scoring valid DTC grid near top-left.
 	static func readWithCalibrate(
 		image: CGImage,
 		preferredCellSize: Int,
@@ -113,20 +215,19 @@ enum DTCReader {
 			throw WindowCaptureError.invalidImage
 		}
 
-		let anchorTarget = ColorCodec.integerToColor(ColorCodec.anchorInteger) // (30,132,129)
+		let anchorTarget = ColorCodec.integerToColor(ColorCodec.anchorInteger)
 		var cellSizes = [preferredCellSize]
 		if searchAlternateCellSizes {
-			// DTC_SIZE=3; Retina often 6; also try larger if UI scale upscales frames
 			cellSizes.append(contentsOf: [3, 6, 2, 4, 5, 8, 9, 12, 1, 7, 10])
 		}
 		var seen = Set<Int>()
 		cellSizes = cellSizes.filter { seen.insert($0).inserted }
 
-		// --- Phase A: color-first search (handles title-bar / offset UI) ---
-		// Search top band + left band of the full capture.
-		let searchMaxY = min(buffer.height - 1, max(120, buffer.height / 4))
-		let searchMaxX = min(buffer.width - 1, max(200, buffer.width / 3))
-		let colorTol = max(18, tolerance + 12)
+		// Prefer TOP of screen (UIParent TOPLEFT). Scenery mid-screen often has false teal.
+		// Search full width of top strip, modest height (title bar + UI scale).
+		let searchMaxY = min(buffer.height - 1, 180)
+		let searchMaxX = min(buffer.width - 1, max(80, buffer.width / 2))
+		let colorTol = 16
 
 		let hits = WindowCapture.findColorMatches(
 			buffer: buffer,
@@ -137,22 +238,40 @@ enum DTCReader {
 			step: 1
 		)
 
-		// Limit candidates for speed
-		let candidates = Array(hits.prefix(80))
+		struct Cand {
+			var frame: DTCFrame
+			var ox: Int
+			var oy: Int
+			var cell: Int
+			var score: Int
+			var hit: String
+		}
+		var best: Cand? = nil
 
-		for hit in candidates {
-			// hit is a pixel inside slot4; try each cell size → origin
+		func consider(frame: DTCFrame, ox: Int, oy: Int, cell: Int, hit: String) {
+			guard frame.gridOK else { return }
+			// Prefer top-left strongly
+			let posPenalty = ox * 2 + oy * 8
+			let total = frame.qualityScore + posPenalty
+			if best == nil || total < best!.score {
+				best = Cand(frame: frame, ox: ox, oy: oy, cell: cell, score: total, hit: hit)
+			}
+		}
+
+		// Phase A: from color hits
+		for hit in hits.prefix(120) {
 			for cell in cellSizes {
-				// Assume hit near center of slot4
-				let ox = hit.x - 4 * cell - cell / 2
-				let oy = hit.y - cell / 2
-				for dyo in -2...2 {
-					for dxo in -2...2 {
-						let originX = ox + dxo
-						let originY = oy + dyo
+				let baseOx = hit.x - 4 * cell - cell / 2
+				let baseOy = hit.y - cell / 2
+				for dyo in -3...3 {
+					for dxo in -3...3 {
+						let originX = baseOx + dxo
+						let originY = baseOy + dyo
 						if originX < 0 || originY < 0 { continue }
 						if originX + cell * slotCount > buffer.width { continue }
 						if originY + cell > buffer.height { continue }
+						// Real DTC is a tiny strip near UI top-left; reject deep mid-screen origins
+						if originX > 400 || originY > 200 { continue }
 						let frame = try read(
 							buffer: buffer,
 							cellSize: cell,
@@ -160,63 +279,63 @@ enum DTCReader {
 							originY: originY,
 							tolerance: tolerance
 						)
-						if frame.anchorOK {
-							let diag = "color-scan hit=(\(hit.x),\(hit.y)) img=\(buffer.width)x\(buffer.height) anchorTarget=\(anchorTarget)"
-							return try refine(
-								buffer: buffer,
-								cell: cell,
-								nearX: originX,
-								nearY: originY,
-								tolerance: tolerance,
-								diag: diag
-							)
-						}
-					}
-				}
-			}
-		}
-
-		// --- Phase B: brute force wider grid (fallback) ---
-		var last = DTCFrame.empty
-		var lastCell = preferredCellSize
-		for cell in cellSizes {
-			let maxX = min(160, max(0, buffer.width - cell * slotCount))
-			let maxY = min(120, max(0, buffer.height - cell))
-			for oy in stride(from: 0, through: maxY, by: 2) {
-				for ox in stride(from: 0, through: maxX, by: 2) {
-					let frame = try read(
-						buffer: buffer,
-						cellSize: cell,
-						originX: ox,
-						originY: oy,
-						tolerance: tolerance
-					)
-					last = frame
-					lastCell = cell
-					if frame.anchorOK {
-						let diag = "grid-scan img=\(buffer.width)x\(buffer.height)"
-						return try refine(
-							buffer: buffer,
+						consider(
+							frame: frame,
+							ox: originX,
+							oy: originY,
 							cell: cell,
-							nearX: ox,
-							nearY: oy,
-							tolerance: tolerance,
-							diag: diag
+							hit: "hit=(\(hit.x),\(hit.y))"
 						)
 					}
 				}
 			}
 		}
 
-		// Diagnostics when failed
+		// Phase B: brute force only top-left corner (true DTC location)
+		if best == nil {
+			for cell in cellSizes {
+				let maxX = min(80, max(0, buffer.width - cell * slotCount))
+				let maxY = min(100, max(0, buffer.height - cell))
+				for oy in stride(from: 0, through: maxY, by: 1) {
+					for ox in stride(from: 0, through: maxX, by: 1) {
+						let frame = try read(
+							buffer: buffer,
+							cellSize: cell,
+							originX: ox,
+							originY: oy,
+							tolerance: tolerance
+						)
+						consider(frame: frame, ox: ox, oy: oy, cell: cell, hit: "grid")
+					}
+				}
+			}
+		}
+
+		if let best {
+			let refined = try refine(
+				buffer: buffer,
+				cell: best.cell,
+				nearX: best.ox,
+				nearY: best.oy,
+				tolerance: tolerance
+			)
+			let diag = "OK score=\(best.score) \(best.hit) img=\(buffer.width)x\(buffer.height) state=\(refined.frame.state) anchorDist=\(refined.frame.pixels[4].distance(to: anchorTarget))"
+			return (refined.frame, refined.ox, refined.oy, refined.cell, diag)
+		}
+
+		// Fail diagnostics
 		let corner = sampleCorners(buffer)
-		let hitCount = hits.count
+		var nearTopLeftSample = DTCFrame.empty
+		if let f = try? read(buffer: buffer, cellSize: 3, originX: 0, originY: 0, tolerance: tolerance) {
+			nearTopLeftSample = f
+		}
 		let diag = """
-		FAIL img=\(buffer.width)x\(buffer.height) anchorTarget=\(anchorTarget) colorHits=\(hitCount) search=\(searchMaxX)x\(searchMaxY) \
-		cornerTL=\(corner.tl) TR=\(corner.tr) sample5@0,0=\(last.pixels.map(\.description).joined(separator: " "))
-		hint: if colorHits=0, capture may miss UI overlay OR color shifted; if colorHits>0 but no grid, cell size mismatch
+		FAIL img=\(buffer.width)x\(buffer.height) anchorTarget=\(anchorTarget) colorHits=\(hits.count) \
+		searchTop=\(searchMaxX)x\(searchMaxY) cornerTL=\(corner.tl) \
+		@0,0 cells=\(nearTopLeftSample.pixels.map(\.description).joined(separator: " ")) \
+		hint: need solid teal + dark state cell; scenery teal rejected
 		"""
-		return (last, 0, 0, lastCell, diag.replacingOccurrences(of: "\n", with: " "))
+		return (nearTopLeftSample, 0, 0, preferredCellSize, diag.replacingOccurrences(of: "\n", with: " "))
 	}
 
 	private static func refine(
@@ -224,12 +343,12 @@ enum DTCReader {
 		cell: Int,
 		nearX: Int,
 		nearY: Int,
-		tolerance: Int,
-		diag: String
-	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int, diag: String) {
-		var best: DTCFrame?
+		tolerance: Int
+	) throws -> (frame: DTCFrame, ox: Int, oy: Int, cell: Int) {
+		var bestFrame: DTCFrame?
 		var bestX = nearX
 		var bestY = nearY
+		var bestScore = Int.max
 		for dy in -2...2 {
 			for dx in -2...2 {
 				let ox = max(0, nearX + dx)
@@ -243,17 +362,18 @@ enum DTCReader {
 					originY: oy,
 					tolerance: tolerance
 				)
-				if frame.anchorOK {
-					if best == nil || ox + oy < bestX + bestY {
-						best = frame
-						bestX = ox
-						bestY = oy
-					}
+				guard frame.gridOK else { continue }
+				let s = frame.qualityScore + ox + oy * 3
+				if s < bestScore {
+					bestScore = s
+					bestFrame = frame
+					bestX = ox
+					bestY = oy
 				}
 			}
 		}
-		if let best {
-			return (best, bestX, bestY, cell, diag)
+		if let bestFrame {
+			return (bestFrame, bestX, bestY, cell)
 		}
 		let fallback = try read(
 			buffer: buffer,
@@ -262,7 +382,7 @@ enum DTCReader {
 			originY: nearY,
 			tolerance: tolerance
 		)
-		return (fallback, nearX, nearY, cell, diag)
+		return (fallback, nearX, nearY, cell)
 	}
 
 	private static func sampleCorners(_ buffer: PixelBuffer) -> (tl: PixelRGB, tr: PixelRGB) {
@@ -317,7 +437,7 @@ final class DTCBridgeLoop {
 
 	func run() throws {
 		log("ZeusBridge starting (dryRun=\(config.dryRun) interval=\(config.intervalMs)ms cell=\(config.cellSize) unifyL=\(config.unifyLeftModifiers))")
-		log("expect anchor RGB \(ColorCodec.integerToColor(ColorCodec.anchorInteger)) from plugin slot4")
+		log("expect anchor RGB \(ColorCodec.integerToColor(ColorCodec.anchorInteger)) + dark state cell (0/1/3/5)")
 		if !config.dryRun {
 			let trusted = KeySynthesizer.isAccessibilityTrusted(prompt: true)
 			if !trusted {
@@ -369,12 +489,13 @@ final class DTCBridgeLoop {
 				originY: originY,
 				tolerance: config.tolerance
 			)
-			if !frame.anchorOK {
+			// Require full grid validation, not just teal slot4
+			if !frame.gridOK {
 				missAnchorCount += 1
-				if missAnchorCount >= 20 {
+				if missAnchorCount >= 25 {
 					calibrated = false
 					missAnchorCount = 0
-					log("anchor lost → recalibrate (img=\(lastImageSize))")
+					log("grid lost → recalibrate (img=\(lastImageSize))")
 				}
 			} else {
 				missAnchorCount = 0
@@ -387,7 +508,7 @@ final class DTCBridgeLoop {
 				searchAlternateCellSizes: config.autoCellSize
 			)
 			frame = result.frame
-			if frame.anchorOK {
+			if frame.gridOK {
 				originX = result.originX
 				originY = result.originY
 				cellSize = result.cellSize
@@ -395,24 +516,19 @@ final class DTCBridgeLoop {
 				log("calibrated origin=(\(originX),\(originY)) cell=\(cellSize) img=\(lastImageSize) \(result.diag)")
 			} else {
 				failLogCounter += 1
-				// Log diagnostic every attempt while failing (throttled every 2nd to reduce spam a bit)
 				if failLogCounter <= 3 || failLogCounter % 5 == 0 {
-					log("no-anchor \(result.diag)")
-					if !frame.pixels.isEmpty {
-						let px = frame.pixels.map(\.description).joined(separator: " ")
-						log("sample@origin0 cells: \(px)")
-					}
+					log("no-grid \(result.diag)")
 				}
 			}
 		}
 
-		if config.verbose, calibrated || frame.anchorOK {
+		if config.verbose {
 			let px = frame.pixels.map(\.description).joined(separator: " ")
-			log("state=\(frame.state) key1=\(frame.key1) key2=\(frame.key2) send=\(frame.sendkey) anchor=\(frame.anchorOK) cell=\(cellSize) \(px)")
+			log("state=\(frame.state) key1=\(frame.key1) key2=\(frame.key2) send=\(frame.sendkey) grid=\(frame.gridOK) cell=\(cellSize) o=(\(originX),\(originY)) \(px)")
 		}
 
-		guard frame.anchorOK else {
-			releaseHeld(reason: "no-anchor")
+		guard frame.gridOK else {
+			releaseHeld(reason: "no-grid")
 			return
 		}
 
