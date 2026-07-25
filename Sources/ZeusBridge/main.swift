@@ -10,7 +10,7 @@ struct CLIOptions {
 	var verbose = false
 	var intervalMs = 40
 	var cellSize = 3
-	var titleRegex = "World of Warcraft|WoW|Classic"
+	var titleRegex = "Wow|魔兽|Warcraft|Classic|World of Warcraft"
 	var originX: Int? = nil
 	var originY: Int? = nil
 	var unifyLeftModifiers = false

@@ -15,6 +15,28 @@ struct WindowInfo: CustomStringConvertible {
 	}
 }
 
+/// Flat RGBA8 top-left origin bitmap for fast scanning.
+struct PixelBuffer {
+	let width: Int
+	let height: Int
+	let rgba: [UInt8] // row-major, 4 bytes/pixel, top-left origin
+
+	func pixel(x: Int, y: Int) -> PixelRGB? {
+		guard x >= 0, y >= 0, x < width, y < height else { return nil }
+		let i = (y * width + x) * 4
+		let a = Int(rgba[i + 3])
+		if a == 0 { return PixelRGB(r: 0, g: 0, b: 0) }
+		if a < 255 {
+			return PixelRGB(
+				r: min(255, Int(rgba[i]) * 255 / a),
+				g: min(255, Int(rgba[i + 1]) * 255 / a),
+				b: min(255, Int(rgba[i + 2]) * 255 / a)
+			)
+		}
+		return PixelRGB(r: Int(rgba[i]), g: Int(rgba[i + 1]), b: Int(rgba[i + 2]))
+	}
+}
+
 enum WindowCaptureError: Error, CustomStringConvertible {
 	case noWindows
 	case notFound(String)
@@ -47,13 +69,12 @@ enum WindowCapture {
 			let layer = item[kCGWindowLayer as String] as? Int ?? 0
 			var bounds = CGRect.zero
 			if let b = item[kCGWindowBounds as String] as? [String: Any] {
-				let rect = CGRect(
+				bounds = CGRect(
 					x: (b["X"] as? NSNumber)?.doubleValue ?? 0,
 					y: (b["Y"] as? NSNumber)?.doubleValue ?? 0,
 					width: (b["Width"] as? NSNumber)?.doubleValue ?? 0,
 					height: (b["Height"] as? NSNumber)?.doubleValue ?? 0
 				)
-				bounds = rect
 			}
 			if id == 0 { continue }
 			result.append(WindowInfo(windowID: id, pid: pid, name: name, owner: owner, bounds: bounds, layer: layer))
@@ -61,7 +82,6 @@ enum WindowCapture {
 		return result
 	}
 
-	/// Find best matching window by title/owner regex.
 	static func findWindow(titleRegex: String) throws -> WindowInfo {
 		let windows = listWindows().filter { $0.layer == 0 && $0.bounds.width >= 200 && $0.bounds.height >= 200 }
 		guard !windows.isEmpty else { throw WindowCaptureError.noWindows }
@@ -84,29 +104,50 @@ enum WindowCapture {
 		throw WindowCaptureError.notFound(titleRegex)
 	}
 
-	/// Capture full window image. Prefer true backing pixels (better for 3px DTC cells).
+	/// Capture full window. Try multiple option combos (games clients differ).
 	static func captureWindow(id: CGWindowID) throws -> CGImage {
-		// Best: native backing resolution without window shadow.
-		if let image = CGWindowListCreateImage(
-			.null,
-			.optionIncludingWindow,
-			id,
-			[.boundsIgnoreFraming, .bestResolution]
-		) {
-			return image
-		}
-		if let image = CGWindowListCreateImage(
-			.null,
-			.optionIncludingWindow,
-			id,
-			[.boundsIgnoreFraming]
-		) {
-			return image
+		let attempts: [CGWindowImageOption] = [
+			[.boundsIgnoreFraming, .bestResolution],
+			[.boundsIgnoreFraming],
+			[.bestResolution],
+			[],
+		]
+		for opt in attempts {
+			if let image = CGWindowListCreateImage(.null, .optionIncludingWindow, id, opt) {
+				if image.width > 10, image.height > 10 {
+					return image
+				}
+			}
 		}
 		throw WindowCaptureError.captureFailed
 	}
 
-	/// Sample median pixel of a cell in top-left grid.
+	/// Rasterize whole image (or region) to RGBA top-left origin for fast scans.
+	static func makeBuffer(_ image: CGImage) -> PixelBuffer? {
+		let w = image.width
+		let h = image.height
+		guard w > 0, h > 0 else { return nil }
+		var rgba = [UInt8](repeating: 0, count: w * h * 4)
+		let colorSpace = CGColorSpaceCreateDeviceRGB()
+		guard let ctx = CGContext(
+			data: &rgba,
+			width: w,
+			height: h,
+			bitsPerComponent: 8,
+			bytesPerRow: w * 4,
+			space: colorSpace,
+			bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+		) else {
+			return nil
+		}
+		// Flip to top-left origin
+		ctx.translateBy(x: 0, y: CGFloat(h))
+		ctx.scaleBy(x: 1, y: -1)
+		ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+		return PixelBuffer(width: w, height: h, rgba: rgba)
+	}
+
+	/// Sample median pixel of a cell in top-left grid (from CGImage).
 	static func sampleCell(
 		image: CGImage,
 		slot: Int,
@@ -114,24 +155,28 @@ enum WindowCapture {
 		originX: Int = 0,
 		originY: Int = 0
 	) throws -> PixelRGB {
-		let w = image.width
-		let h = image.height
+		guard let buf = makeBuffer(image) else { throw WindowCaptureError.invalidImage }
+		return try sampleCell(buffer: buf, slot: slot, cellSize: cellSize, originX: originX, originY: originY)
+	}
+
+	static func sampleCell(
+		buffer: PixelBuffer,
+		slot: Int,
+		cellSize: Int,
+		originX: Int,
+		originY: Int
+	) throws -> PixelRGB {
 		let cx = originX + slot * cellSize + max(0, cellSize / 2)
 		let cy = originY + max(0, cellSize / 2)
-		guard cx >= 0, cy >= 0, cx < w, cy < h else {
+		guard cx >= 0, cy >= 0, cx < buffer.width, cy < buffer.height else {
 			throw WindowCaptureError.invalidImage
 		}
-
 		let radius = max(0, (cellSize - 1) / 2)
 		var samples: [PixelRGB] = []
 		for dy in -radius...radius {
 			for dx in -radius...radius {
-				let x = cx + dx
-				let y = cy + dy
-				if x >= 0, y >= 0, x < w, y < h {
-					if let p = readPixel(image: image, x: x, y: y) {
-						samples.append(p)
-					}
+				if let p = buffer.pixel(x: cx + dx, y: cy + dy) {
+					samples.append(p)
 				}
 			}
 		}
@@ -139,37 +184,43 @@ enum WindowCapture {
 		return medianPixel(samples)
 	}
 
-	// MARK: - Pixel read
-
-	private static func readPixel(image: CGImage, x: Int, y: Int) -> PixelRGB? {
-		guard let cropped = image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)) else {
-			return nil
+	/// Find pixels matching target color in a search band (fast).
+	static func findColorMatches(
+		buffer: PixelBuffer,
+		target: PixelRGB,
+		tolerance: Int,
+		maxX: Int,
+		maxY: Int,
+		step: Int = 1
+	) -> [(x: Int, y: Int, dist: Int)] {
+		let xLimit = min(maxX, buffer.width - 1)
+		let yLimit = min(maxY, buffer.height - 1)
+		var hits: [(Int, Int, Int)] = []
+		let s = max(1, step)
+		var y = 0
+		while y <= yLimit {
+			var x = 0
+			while x <= xLimit {
+				if let p = buffer.pixel(x: x, y: y) {
+					let d = p.distance(to: target)
+					// per-channel-ish: total L1 distance
+					if abs(p.r - target.r) <= tolerance,
+					   abs(p.g - target.g) <= tolerance,
+					   abs(p.b - target.b) <= tolerance {
+						hits.append((x, y, d))
+					}
+				}
+				x += s
+			}
+			y += s
 		}
-		let colorSpace = CGColorSpaceCreateDeviceRGB()
-		var rgba: [UInt8] = [0, 0, 0, 0]
-		guard let ctx = CGContext(
-			data: &rgba,
-			width: 1,
-			height: 1,
-			bitsPerComponent: 8,
-			bytesPerRow: 4,
-			space: colorSpace,
-			bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-		) else {
-			return nil
+		// Prefer top-left
+		hits.sort {
+			if $0.2 != $1.2 { return $0.2 < $1.2 }
+			if $0.1 != $1.1 { return $0.1 < $1.1 }
+			return $0.0 < $1.0
 		}
-		ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: 1, height: 1))
-		let a = Int(rgba[3])
-		if a == 0 {
-			return PixelRGB(r: 0, g: 0, b: 0)
-		}
-		if a < 255 {
-			let r = min(255, Int(rgba[0]) * 255 / a)
-			let g = min(255, Int(rgba[1]) * 255 / a)
-			let b = min(255, Int(rgba[2]) * 255 / a)
-			return PixelRGB(r: r, g: g, b: b)
-		}
-		return PixelRGB(r: Int(rgba[0]), g: Int(rgba[1]), b: Int(rgba[2]))
+		return hits.map { (x: $0.0, y: $0.1, dist: $0.2) }
 	}
 
 	private static func medianPixel(_ samples: [PixelRGB]) -> PixelRGB {

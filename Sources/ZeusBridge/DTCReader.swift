@@ -7,9 +7,8 @@ struct DTCFrame: Equatable {
 	var key1: String
 	var key2: String
 	var anchorOK: Bool
-	var pixels: [PixelRGB] // 0..4
+	var pixels: [PixelRGB]
 	var sendkey: String
-	/// Macro_AI: decoded from slot3 when state==5 (G≈TNum, B≈ANum).
 	var aiTNum: Int?
 	var aiANum: Int?
 
@@ -22,9 +21,9 @@ struct DTCFrame: Equatable {
 enum DTCReader {
 	static let slotCount = 5
 
-	/// Read 5 DTC cells from a window image.
+	/// Read 5 DTC cells from a raster buffer.
 	static func read(
-		image: CGImage,
+		buffer: PixelBuffer,
 		cellSize: Int,
 		originX: Int,
 		originY: Int,
@@ -33,7 +32,7 @@ enum DTCReader {
 		var pixels: [PixelRGB] = []
 		for slot in 0..<slotCount {
 			let p = try WindowCapture.sampleCell(
-				image: image,
+				buffer: buffer,
 				slot: slot,
 				cellSize: cellSize,
 				originX: originX,
@@ -41,10 +40,29 @@ enum DTCReader {
 			)
 			pixels.append(p)
 		}
+		return decodePixels(pixels, tolerance: tolerance)
+	}
 
-		let anchorOK = ColorCodec.isAnchor(pixels[4], tolerance: max(tolerance, 5))
+	/// Convenience from CGImage.
+	static func read(
+		image: CGImage,
+		cellSize: Int,
+		originX: Int,
+		originY: Int,
+		tolerance: Int = 3
+	) throws -> DTCFrame {
+		guard let buf = WindowCapture.makeBuffer(image) else {
+			throw WindowCaptureError.invalidImage
+		}
+		return try read(buffer: buf, cellSize: cellSize, originX: originX, originY: originY, tolerance: tolerance)
+	}
+
+	private static func decodePixels(_ pixels: [PixelRGB], tolerance: Int) -> DTCFrame {
+		// Looser anchor match: Mac display color can shift DTC teal.
+		let anchorTol = max(tolerance, 18)
+		let anchorOK = ColorCodec.isAnchor(pixels[4], tolerance: anchorTol)
 		let dataNum = ColorCodec.decodeInteger(pixels[0], tolerance: tolerance)
-		let state = ColorCodec.decodeState(pixels[1], tolerance: max(tolerance, 4))
+		let state = ColorCodec.decodeState(pixels[1], tolerance: max(tolerance, 6))
 
 		var key1 = ""
 		var key2 = ""
@@ -52,7 +70,6 @@ enum DTCReader {
 		var aiA: Int? = nil
 
 		if state == 5 {
-			// AI channel: key2 texture is {0, TNum/255, ANum/255} → sample G/B ≈ TNum/ANum
 			aiT = ColorCodec.decodeChannel(pixels[3].g, tolerance: tolerance)
 			aiA = ColorCodec.decodeChannel(pixels[3].b, tolerance: tolerance)
 			key2 = String(format: "ai:T=%d,A=%d", aiT ?? -1, aiA ?? -1)
@@ -85,99 +102,148 @@ enum DTCReader {
 		)
 	}
 
-	/// Try origin offsets and multiple cell sizes until anchor matches.
+	/// Calibrate: scan for anchor teal (30,132,129), then fit 5-cell grid.
 	static func readWithCalibrate(
 		image: CGImage,
 		preferredCellSize: Int,
 		tolerance: Int = 3,
 		searchAlternateCellSizes: Bool = true
-	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int) {
-		// Prefer configured size first, then common Retina multiples of DTC_SIZE=3.
+	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int, diag: String) {
+		guard let buffer = WindowCapture.makeBuffer(image) else {
+			throw WindowCaptureError.invalidImage
+		}
+
+		let anchorTarget = ColorCodec.integerToColor(ColorCodec.anchorInteger) // (30,132,129)
 		var cellSizes = [preferredCellSize]
 		if searchAlternateCellSizes {
-			cellSizes.append(contentsOf: [3, 6, 2, 4, 5, 8, 9])
+			// DTC_SIZE=3; Retina often 6; also try larger if UI scale upscales frames
+			cellSizes.append(contentsOf: [3, 6, 2, 4, 5, 8, 9, 12, 1, 7, 10])
 		}
 		var seen = Set<Int>()
 		cellSizes = cellSizes.filter { seen.insert($0).inserted }
 
-		var last = DTCFrame.empty
-		var lastCell = preferredCellSize
+		// --- Phase A: color-first search (handles title-bar / offset UI) ---
+		// Search top band + left band of the full capture.
+		let searchMaxY = min(buffer.height - 1, max(120, buffer.height / 4))
+		let searchMaxX = min(buffer.width - 1, max(200, buffer.width / 3))
+		let colorTol = max(18, tolerance + 12)
 
-		for cell in cellSizes {
-			let maxX = min(40, max(0, image.width - cell * slotCount))
-			let maxY = min(28, max(0, image.height - cell))
+		let hits = WindowCapture.findColorMatches(
+			buffer: buffer,
+			target: anchorTarget,
+			tolerance: colorTol,
+			maxX: searchMaxX,
+			maxY: searchMaxY,
+			step: 1
+		)
 
-			// Phase 1: coarse grid (fast)
-			for oy in stride(from: 0, through: maxY, by: 2) {
-				for ox in stride(from: 0, through: maxX, by: 2) {
-					let frame = try read(
-						image: image,
-						cellSize: cell,
-						originX: ox,
-						originY: oy,
-						tolerance: tolerance
-					)
-					last = frame
-					lastCell = cell
-					if frame.anchorOK {
-						// Phase 2: refine ±1 around hit
-						return try refineAnchor(
-							image: image,
-							cell: cell,
-							nearX: ox,
-							nearY: oy,
+		// Limit candidates for speed
+		let candidates = Array(hits.prefix(80))
+
+		for hit in candidates {
+			// hit is a pixel inside slot4; try each cell size → origin
+			for cell in cellSizes {
+				// Assume hit near center of slot4
+				let ox = hit.x - 4 * cell - cell / 2
+				let oy = hit.y - cell / 2
+				for dyo in -2...2 {
+					for dxo in -2...2 {
+						let originX = ox + dxo
+						let originY = oy + dyo
+						if originX < 0 || originY < 0 { continue }
+						if originX + cell * slotCount > buffer.width { continue }
+						if originY + cell > buffer.height { continue }
+						let frame = try read(
+							buffer: buffer,
+							cellSize: cell,
+							originX: originX,
+							originY: originY,
 							tolerance: tolerance
 						)
-					}
-				}
-			}
-			// Phase 1b: remaining odd offsets if needed (only small region)
-			for oy in 0...min(8, maxY) {
-				for ox in 0...min(12, maxX) {
-					if ox % 2 == 0 && oy % 2 == 0 { continue }
-					let frame = try read(
-						image: image,
-						cellSize: cell,
-						originX: ox,
-						originY: oy,
-						tolerance: tolerance
-					)
-					last = frame
-					lastCell = cell
-					if frame.anchorOK {
-						return (frame, ox, oy, cell)
+						if frame.anchorOK {
+							let diag = "color-scan hit=(\(hit.x),\(hit.y)) img=\(buffer.width)x\(buffer.height) anchorTarget=\(anchorTarget)"
+							return try refine(
+								buffer: buffer,
+								cell: cell,
+								nearX: originX,
+								nearY: originY,
+								tolerance: tolerance,
+								diag: diag
+							)
+						}
 					}
 				}
 			}
 		}
-		return (last, 0, 0, lastCell)
+
+		// --- Phase B: brute force wider grid (fallback) ---
+		var last = DTCFrame.empty
+		var lastCell = preferredCellSize
+		for cell in cellSizes {
+			let maxX = min(160, max(0, buffer.width - cell * slotCount))
+			let maxY = min(120, max(0, buffer.height - cell))
+			for oy in stride(from: 0, through: maxY, by: 2) {
+				for ox in stride(from: 0, through: maxX, by: 2) {
+					let frame = try read(
+						buffer: buffer,
+						cellSize: cell,
+						originX: ox,
+						originY: oy,
+						tolerance: tolerance
+					)
+					last = frame
+					lastCell = cell
+					if frame.anchorOK {
+						let diag = "grid-scan img=\(buffer.width)x\(buffer.height)"
+						return try refine(
+							buffer: buffer,
+							cell: cell,
+							nearX: ox,
+							nearY: oy,
+							tolerance: tolerance,
+							diag: diag
+						)
+					}
+				}
+			}
+		}
+
+		// Diagnostics when failed
+		let corner = sampleCorners(buffer)
+		let hitCount = hits.count
+		let diag = """
+		FAIL img=\(buffer.width)x\(buffer.height) anchorTarget=\(anchorTarget) colorHits=\(hitCount) search=\(searchMaxX)x\(searchMaxY) \
+		cornerTL=\(corner.tl) TR=\(corner.tr) sample5@0,0=\(last.pixels.map(\.description).joined(separator: " "))
+		hint: if colorHits=0, capture may miss UI overlay OR color shifted; if colorHits>0 but no grid, cell size mismatch
+		"""
+		return (last, 0, 0, lastCell, diag.replacingOccurrences(of: "\n", with: " "))
 	}
 
-	private static func refineAnchor(
-		image: CGImage,
+	private static func refine(
+		buffer: PixelBuffer,
 		cell: Int,
 		nearX: Int,
 		nearY: Int,
-		tolerance: Int
-	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int) {
+		tolerance: Int,
+		diag: String
+	) throws -> (frame: DTCFrame, originX: Int, originY: Int, cellSize: Int, diag: String) {
 		var best: DTCFrame?
 		var bestX = nearX
 		var bestY = nearY
-		for dy in -1...1 {
-			for dx in -1...1 {
+		for dy in -2...2 {
+			for dx in -2...2 {
 				let ox = max(0, nearX + dx)
 				let oy = max(0, nearY + dy)
-				if ox + cell * slotCount > image.width { continue }
-				if oy + cell > image.height { continue }
+				if ox + cell * slotCount > buffer.width { continue }
+				if oy + cell > buffer.height { continue }
 				let frame = try read(
-					image: image,
+					buffer: buffer,
 					cellSize: cell,
 					originX: ox,
 					originY: oy,
 					tolerance: tolerance
 				)
 				if frame.anchorOK {
-					// Prefer closer to (0,0) among valid anchors
 					if best == nil || ox + oy < bestX + bestY {
 						best = frame
 						bestX = ox
@@ -187,16 +253,22 @@ enum DTCReader {
 			}
 		}
 		if let best {
-			return (best, bestX, bestY, cell)
+			return (best, bestX, bestY, cell, diag)
 		}
 		let fallback = try read(
-			image: image,
+			buffer: buffer,
 			cellSize: cell,
 			originX: nearX,
 			originY: nearY,
 			tolerance: tolerance
 		)
-		return (fallback, nearX, nearY, cell)
+		return (fallback, nearX, nearY, cell, diag)
+	}
+
+	private static func sampleCorners(_ buffer: PixelBuffer) -> (tl: PixelRGB, tr: PixelRGB) {
+		let tl = buffer.pixel(x: 0, y: 0) ?? PixelRGB(r: 0, g: 0, b: 0)
+		let tr = buffer.pixel(x: max(0, buffer.width - 1), y: 0) ?? PixelRGB(r: 0, g: 0, b: 0)
+		return (tl, tr)
 	}
 
 	private static func isNearBlack(_ p: PixelRGB, tolerance: Int) -> Bool {
@@ -207,7 +279,7 @@ enum DTCReader {
 /// Edge-triggered key dispatcher with hold + Macro_AI support.
 final class DTCBridgeLoop {
 	struct Config {
-		var titleRegex: String = "World of Warcraft|WoW|Classic"
+		var titleRegex: String = "Wow|魔兽|Warcraft|Classic|World of Warcraft"
 		var intervalMs: Int = 40
 		var cellSize: Int = 3
 		var dryRun: Bool = false
@@ -215,9 +287,7 @@ final class DTCBridgeLoop {
 		var tolerance: Int = 3
 		var fixedOriginX: Int? = nil
 		var fixedOriginY: Int? = nil
-		/// Map right modifiers to left (helps some Mac WoW builds).
 		var unifyLeftModifiers: Bool = false
-		/// Auto-search cell size on calibrate (default true).
 		var autoCellSize: Bool = true
 		var aiGapMs: Int = 25
 		var aiHoldMs: Int = 25
@@ -234,8 +304,9 @@ final class DTCBridgeLoop {
 	private var calibrated: Bool = false
 	private var windowID: CGWindowID = 0
 	private var missAnchorCount: Int = 0
+	private var failLogCounter: Int = 0
+	private var lastImageSize: String = ""
 
-	/// Currently held stroke for state=3 (nil when not holding).
 	private var heldStroke: KeyStroke? = nil
 	private var heldSendkey: String = ""
 
@@ -246,10 +317,11 @@ final class DTCBridgeLoop {
 
 	func run() throws {
 		log("ZeusBridge starting (dryRun=\(config.dryRun) interval=\(config.intervalMs)ms cell=\(config.cellSize) unifyL=\(config.unifyLeftModifiers))")
+		log("expect anchor RGB \(ColorCodec.integerToColor(ColorCodec.anchorInteger)) from plugin slot4")
 		if !config.dryRun {
 			let trusted = KeySynthesizer.isAccessibilityTrusted(prompt: true)
 			if !trusted {
-				log("WARN: Accessibility not granted — key injection will fail. System Settings → Privacy → Accessibility")
+				log("WARN: Accessibility not granted — System Settings → Privacy → Accessibility")
 			}
 		}
 
@@ -286,6 +358,7 @@ final class DTCBridgeLoop {
 
 	private func tick() throws {
 		let image = try WindowCapture.captureWindow(id: windowID)
+		lastImageSize = "\(image.width)x\(image.height)"
 		let frame: DTCFrame
 
 		if calibrated {
@@ -298,10 +371,10 @@ final class DTCBridgeLoop {
 			)
 			if !frame.anchorOK {
 				missAnchorCount += 1
-				if missAnchorCount >= 15 {
+				if missAnchorCount >= 20 {
 					calibrated = false
 					missAnchorCount = 0
-					if config.verbose { log("anchor lost → recalibrate") }
+					log("anchor lost → recalibrate (img=\(lastImageSize))")
 				}
 			} else {
 				missAnchorCount = 0
@@ -319,22 +392,30 @@ final class DTCBridgeLoop {
 				originY = result.originY
 				cellSize = result.cellSize
 				calibrated = true
-				log("calibrated origin=(\(originX),\(originY)) cell=\(cellSize) anchor OK")
+				log("calibrated origin=(\(originX),\(originY)) cell=\(cellSize) img=\(lastImageSize) \(result.diag)")
+			} else {
+				failLogCounter += 1
+				// Log diagnostic every attempt while failing (throttled every 2nd to reduce spam a bit)
+				if failLogCounter <= 3 || failLogCounter % 5 == 0 {
+					log("no-anchor \(result.diag)")
+					if !frame.pixels.isEmpty {
+						let px = frame.pixels.map(\.description).joined(separator: " ")
+						log("sample@origin0 cells: \(px)")
+					}
+				}
 			}
 		}
 
-		if config.verbose {
-			let px = frame.pixels.map { $0.description }.joined(separator: " ")
+		if config.verbose, calibrated || frame.anchorOK {
+			let px = frame.pixels.map(\.description).joined(separator: " ")
 			log("state=\(frame.state) key1=\(frame.key1) key2=\(frame.key2) send=\(frame.sendkey) anchor=\(frame.anchorOK) cell=\(cellSize) \(px)")
 		}
 
 		guard frame.anchorOK else {
 			releaseHeld(reason: "no-anchor")
-			if config.verbose { log("skip: no anchor") }
 			return
 		}
 
-		// state 0: keyboard focus — do not press; release any hold
 		if frame.state == 0 {
 			releaseHeld(reason: "focus")
 			lastSendkey = ""
@@ -343,7 +424,6 @@ final class DTCBridgeLoop {
 			return
 		}
 
-		// state 5: Macro_AI — four RALT+NUMPAD taps encoding TNum/ANum
 		if frame.state == 5 {
 			releaseHeld(reason: "ai")
 			try handleAI(frame)
@@ -354,7 +434,6 @@ final class DTCBridgeLoop {
 
 		let send = frame.sendkey
 		if send.isEmpty {
-			// Keys cleared after PIXEL_INTERVAL — end hold + reset edge
 			releaseHeld(reason: "clear")
 			lastSendkey = ""
 			lastState = frame.state
@@ -362,7 +441,6 @@ final class DTCBridgeLoop {
 			return
 		}
 
-		// state 3: hold while pixels stay active
 		if frame.state == 3 {
 			try handleHold(send: send)
 			lastSendkey = send
@@ -370,8 +448,6 @@ final class DTCBridgeLoop {
 			return
 		}
 
-		// state 1 (and any other): edge-triggered tap
-		// If we were holding something else, release first.
 		if heldStroke != nil {
 			releaseHeld(reason: "tap")
 		}
@@ -400,11 +476,7 @@ final class DTCBridgeLoop {
 	}
 
 	private func handleHold(send: String) throws {
-		if heldStroke != nil, heldSendkey == send {
-			// already holding the same key
-			return
-		}
-		// switch hold target
+		if heldStroke != nil, heldSendkey == send { return }
 		releaseHeld(reason: "switch")
 		var stroke = try KeyMap.parse(send)
 		if config.unifyLeftModifiers {
@@ -435,24 +507,13 @@ final class DTCBridgeLoop {
 	}
 
 	private func handleAI(_ frame: DTCFrame) throws {
-		guard let t = frame.aiTNum, let a = frame.aiANum else {
-			if config.verbose { log("[ai] missing T/A channels") }
-			return
-		}
+		guard let t = frame.aiTNum, let a = frame.aiANum else { return }
 		let token = "\(t):\(a)"
-		// Edge: only fire once per AI paint window
-		if token == lastAIToken {
-			return
-		}
-		// Also require non-zero-ish paint (ANum at least 1 for a real skill slot usually)
-		// Allow TNum=1 (empty unit) + ANum>=1
-		if t == 0 && a == 0 {
-			return
-		}
+		if token == lastAIToken { return }
+		if t == 0 && a == 0 { return }
 
 		var strokes = try KeyMap.aiSequence(tNum: t, aNum: a)
 		if config.unifyLeftModifiers {
-			// RALT → LALT for each digit
 			strokes = strokes.map { $0.unifiedLeftModifiers() }
 		}
 		let label = strokes.map(\.label).joined(separator: " ")

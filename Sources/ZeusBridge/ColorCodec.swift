@@ -141,7 +141,8 @@ enum ColorCodec {
 	}
 
 	/// Whether pixel matches anchor 2000001 within tolerance per channel.
-	static func isAnchor(_ pixel: PixelRGB, tolerance: Int = 5) -> Bool {
+	/// Default tolerance is looser: macOS display/ICC can shift game UI colors.
+	static func isAnchor(_ pixel: PixelRGB, tolerance: Int = 18) -> Bool {
 		let target = integerToColor(anchorInteger)
 		return abs(pixel.r - target.r) <= tolerance
 			&& abs(pixel.g - target.g) <= tolerance
