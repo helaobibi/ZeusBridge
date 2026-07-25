@@ -121,7 +121,7 @@ enum DTCReader {
 					lastCell = cell
 					if frame.anchorOK {
 						// Phase 2: refine ±1 around hit
-						return refineAnchor(
+						return try refineAnchor(
 							image: image,
 							cell: cell,
 							nearX: ox,
